@@ -22,7 +22,7 @@ A Python tool that uses the [nba_api](https://github.com/swar/nba_api) package t
 
 1. Clone this repository:
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/rli007/nbahighlights.git
 cd nbahighlights
 ```
 

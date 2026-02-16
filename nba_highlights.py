@@ -13,8 +13,10 @@ Builds a player highlight reel by:
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import parse_qs, quote, urljoin, urlparse
@@ -33,6 +35,32 @@ try:
 except ImportError:
     NBA_API_AVAILABLE = False
     print("Warning: nba_api not installed. Install with: pip install nba_api")
+
+
+@dataclass
+class ScriptSettings:
+    """One-click run settings used when no CLI args are passed."""
+
+    player_name: str = "Derrick White"
+    season: str = "2025-26"
+    event_type: str = "blocks"  # highlights | blocks
+    max_highlights: int = 999
+    all_games: bool = False
+    max_games: int = 6
+    # Game selection filters (applied in order: date/opponent, then recent index fallback)
+    target_date: Optional[str] = "2025-12-30"  # YYYY-MM-DD or "Dec 30, 2025"
+    target_opponent: Optional[str] = "UTA"  # Team abbreviation in matchup string
+    recent_game_index: int = 0  # 0=most recent, 1=second-most recent, etc.
+    # Output controls
+    output_basename: str = "auto_reel.mp4"
+    trim_last_seconds: int = 10
+    auto_stitch: bool = True
+    downloads_dir: str = "downloads"
+    output_dir: str = "output"
+
+
+# Edit this block once, then run: python nba_highlights.py
+SCRIPT_SETTINGS = ScriptSettings()
 
 
 def _current_season_str() -> str:
@@ -70,7 +98,7 @@ class NBAHighlightsFinder:
         "and-1",
         "buzzer",
     )
-    BLOCK_TERMS = (" block ", "blocks", "blocked", "blk")
+    BLOCK_TERMS = (" block ", "blocks", "blk")
 
     def __init__(self, player_name: str, season: Optional[str] = None) -> None:
         self.player_name = player_name.strip()
@@ -162,13 +190,10 @@ class NBAHighlightsFinder:
         """Return True when the action looks like a block event."""
         action_type = str(action.get("actionType", "")).lower()
         sub_type = str(action.get("subType", "")).lower()
-        description = str(action.get("description", "")).lower()
-
         if "block" in action_type or "block" in sub_type:
             return True
-        # Keep conservative text matching to avoid false positives.
-        padded = f" {description} "
-        return any(term in padded for term in self.BLOCK_TERMS)
+        # Avoid matching "MISS ... blocked" shot descriptions as standalone block clips.
+        return False
 
     def _event_matches_requested_type(self, action: Dict, event_type: str) -> bool:
         """Filter events by requested type."""
@@ -248,6 +273,97 @@ class NBAHighlightsFinder:
         candidates.extend(self._search_nba_videos_from_url(query_url))
         return candidates
 
+    def _build_context_measure_url(self, game_id: str, team_id: int, context_measure: str) -> str:
+        """Build NBA stats game context-measure URL (e.g. BLK sequence view)."""
+        return (
+            "https://www.nba.com/stats/events"
+            "?CFID=&CFPARAMS="
+            f"&ContextMeasure={quote(context_measure)}"
+            "&EndPeriod=0&EndRange=28800"
+            f"&GameID={game_id}"
+            f"&PlayerID={self.player_id or 0}"
+            "&RangeType=0"
+            f"&Season={quote(self.season)}"
+            "&SeasonType=Regular%20Season"
+            "&StartPeriod=0&StartRange=0"
+            f"&TeamID={team_id}"
+            "&flag=1&sct=plot&section=game"
+        )
+
+    def _get_context_measure_video_candidates(
+        self, game_id: str, team_id: int, context_measure: str
+    ) -> List[Dict]:
+        """
+        Pull clip candidates directly from VideoDetailsAsset context measure.
+        This aligns with URLs like ContextMeasure=BLK shown on nba.com/stats/events.
+        """
+        candidates: List[Dict] = []
+        if not self.player_id or not team_id:
+            return candidates
+
+        try:
+            payload = videodetailsasset.VideoDetailsAsset(
+                team_id=team_id,
+                player_id=self.player_id,
+                context_measure_detailed=context_measure,
+                game_id_nullable=game_id,
+                season=self.season,
+                season_type_all_star="Regular Season",
+                timeout=25,
+            )
+            result_sets = payload.get_dict().get("resultSets", {})
+            meta_urls = result_sets.get("Meta", {}).get("videoUrls", [])
+            playlist = result_sets.get("playlist", [])
+
+            for index, event in enumerate(playlist):
+                event_num = int(event.get("ei", 0) or 0)
+                event_title = str(event.get("dsc", "")).strip()
+                if not event_title:
+                    event_title = f"{self.player_name} {context_measure}"
+                # Normalize "J. Huff ..." -> "Huff ..." for cleaner titles/links.
+                event_title = re.sub(r"^[A-Z]\.\s+", "", event_title)
+                if context_measure.upper() == "BLK":
+                    last = self.player_name.split()[-1] if self.player_name else "Player"
+                    event_title = f"{last} BLOCK ({index + 1} BLK)"
+
+                if index < len(meta_urls):
+                    video = meta_urls[index]
+                    media_url = ""
+                    for key in ("lurl", "murl", "surl"):
+                        candidate_url = str(video.get(key, "")).strip()
+                        if candidate_url.startswith(("http://", "https://")):
+                            media_url = candidate_url
+                            break
+                    if media_url:
+                        candidates.append(
+                            {
+                                "url": media_url,
+                                "title": event_title,
+                                "description": f"Event {event_num}",
+                            }
+                        )
+
+                stats_event_url = (
+                    f"https://www.nba.com/stats/events?CFID=&CFPARAMS=&GameEventID={event_num}"
+                    f"&GameID={game_id}&Season={self.season}&flag=1&title={quote(event_title)}"
+                )
+                candidates.append(
+                    {"url": stats_event_url, "title": event_title, "description": f"Event {event_num}"}
+                )
+
+            # Also include the context page itself as a human-debuggable fallback source.
+            candidates.append(
+                {
+                    "url": self._build_context_measure_url(game_id, team_id, context_measure),
+                    "title": f"{self.player_name} {context_measure} sequence",
+                    "description": f"{context_measure} context page",
+                }
+            )
+        except Exception:
+            return candidates
+
+        return candidates
+
     def _search_nba_videos_from_url(self, url: str) -> List[Dict]:
         """Extract candidate video pages from NBA.com search HTML."""
         links: List[Dict] = []
@@ -324,6 +440,11 @@ class NBAHighlightsFinder:
         for game in games:
             game_id = game["game_id"]
             team_id = int(game.get("team_id", 0) or 0)
+            if event_type == "blocks":
+                # Prefer the explicit BLK sequence endpoint; it is closer to NBA.com box-score event view.
+                found.extend(self._get_context_measure_video_candidates(game_id, team_id, "BLK"))
+                if len(found) >= max_results * 3:
+                    break
             try:
                 pbp_live = live_playbyplay.PlayByPlay(game_id=game_id, timeout=20)
                 actions = pbp_live.get_dict().get("game", {}).get("actions", [])
@@ -458,6 +579,29 @@ def _parse_stats_event_url(event_url: str) -> Optional[Dict[str, str]]:
     return {"game_id": game_id, "event_id": event_id, "season": season}
 
 
+def _normalize_date_token(value: str) -> str:
+    return str(value or "").strip().lower().replace("  ", " ")
+
+
+def _date_matches(target_date: str, game_date: str) -> bool:
+    target = _normalize_date_token(target_date)
+    game = _normalize_date_token(game_date)
+    if not target or not game:
+        return False
+    if target == game:
+        return True
+    # Support YYYY-MM-DD target against "Mon DD, YYYY" source.
+    try:
+        from datetime import datetime
+
+        if "-" in target:
+            target_fmt = datetime.strptime(target, "%Y-%m-%d").strftime("%b %d, %Y").lower()
+            return target_fmt == game
+    except ValueError:
+        return False
+    return False
+
+
 def resolve_direct_media_urls_from_event_url(event_url: str) -> List[str]:
     """
     Resolve direct videos.nba.com clip URLs from an NBA stats event URL.
@@ -579,23 +723,81 @@ def download_video_from_source_url(
     return None
 
 
+def trim_last_seconds_of_clips(
+    input_paths: List[str],
+    seconds: int,
+    output_dir: str,
+) -> List[str]:
+    """Trim each clip to last N seconds (or full length if shorter)."""
+    if seconds <= 0:
+        return input_paths
+
+    stitcher = VideoStitcher(output_dir=output_dir)
+    ffmpeg_bin = stitcher.ffmpeg_bin
+    if not ffmpeg_bin:
+        print("Warning: ffmpeg not available, skipping trim step.")
+        return input_paths
+
+    out_dir = Path(output_dir) / "trimmed"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    trimmed: List[str] = []
+    for src in input_paths:
+        src_path = Path(src)
+        out_path = out_dir / src_path.name
+        cmd = [
+            ffmpeg_bin,
+            "-y",
+            "-sseof",
+            f"-{seconds}",
+            "-i",
+            str(src_path),
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+            str(out_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            trimmed.append(str(out_path))
+        else:
+            print(f"Warning: trim failed for {src_path.name}, keeping original clip")
+            trimmed.append(str(src_path))
+    return trimmed
+
+
 class VideoStitcher:
     """Concatenate clips into a final reel."""
 
     def __init__(self, output_dir: str = "output") -> None:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
+        self.ffmpeg_bin = self._resolve_ffmpeg_bin()
+
+    def _resolve_ffmpeg_bin(self) -> Optional[str]:
+        system_ffmpeg = shutil.which("ffmpeg")
+        if system_ffmpeg:
+            return system_ffmpeg
+        try:
+            import imageio_ffmpeg
+
+            return imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            return None
 
     def _check_ffmpeg(self) -> bool:
+        if not self.ffmpeg_bin:
+            return False
         try:
-            subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
+            subprocess.run([self.ffmpeg_bin, "-version"], capture_output=True, check=True)
             return True
         except (subprocess.CalledProcessError, FileNotFoundError):
             return False
 
     def stitch_videos(self, video_paths: List[str], output_filename: str) -> Optional[str]:
         if not self._check_ffmpeg():
-            print("Error: ffmpeg is not installed. Install with: brew install ffmpeg")
+            print("Error: ffmpeg is not available.")
+            print("Install system ffmpeg or run: pip install imageio-ffmpeg")
             return None
 
         valid = [v for v in video_paths if v and os.path.exists(v)]
@@ -612,7 +814,7 @@ class VideoStitcher:
 
             # Try stream copy first (fast), then re-encode fallback.
             cmd_copy = [
-                "ffmpeg",
+                self.ffmpeg_bin,
                 "-f",
                 "concat",
                 "-safe",
@@ -629,7 +831,7 @@ class VideoStitcher:
                 return str(output_path)
 
             cmd_reencode = [
-                "ffmpeg",
+                self.ffmpeg_bin,
                 "-f",
                 "concat",
                 "-safe",
@@ -657,7 +859,7 @@ class VideoStitcher:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build a player highlight reel")
-    parser.add_argument("player_name", help='Player name, e.g. "LeBron James"')
+    parser.add_argument("player_name", nargs="?", default=None, help='Player name, e.g. "LeBron James"')
     parser.add_argument("max_highlights", nargs="?", default=10, type=int)
     parser.add_argument("--season", default=None, help='Season like "2025-26"')
     parser.add_argument("--max-games", type=int, default=6)
@@ -672,13 +874,49 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Process all games in the selected season (instead of only --max-games)",
     )
+    parser.add_argument("--target-date", default=None, help="Target game date, e.g. 2025-12-30")
+    parser.add_argument("--target-opponent", default=None, help="Opponent abbreviation, e.g. UTA")
+    parser.add_argument("--recent-game-index", type=int, default=None, help="0=most recent game")
+    parser.add_argument("--trim-last-seconds", type=int, default=0, help="Trim each clip to last N seconds")
+    parser.add_argument("--output-name", default=None, help="Final stitched output filename")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    player_name = args.player_name
-    max_highlights = max(1, int(args.max_highlights))
+    use_script_settings = args.player_name is None
+    if use_script_settings:
+        cfg = SCRIPT_SETTINGS
+        player_name = cfg.player_name
+        max_highlights = max(1, int(cfg.max_highlights))
+        season = cfg.season
+        event_type = cfg.event_type
+        all_games = cfg.all_games
+        max_games = cfg.max_games
+        target_date = cfg.target_date
+        target_opponent = cfg.target_opponent
+        recent_game_index = cfg.recent_game_index
+        trim_last_seconds = max(0, int(cfg.trim_last_seconds))
+        output_name = cfg.output_basename
+        downloads_dir = cfg.downloads_dir
+        output_dir = cfg.output_dir
+        auto_stitch = cfg.auto_stitch
+        print("Running with SCRIPT_SETTINGS (no CLI args provided).")
+    else:
+        player_name = args.player_name
+        max_highlights = max(1, int(args.max_highlights))
+        season = args.season
+        event_type = args.event_type
+        all_games = args.all_games
+        max_games = args.max_games
+        target_date = args.target_date
+        target_opponent = args.target_opponent
+        recent_game_index = args.recent_game_index
+        trim_last_seconds = max(0, int(args.trim_last_seconds or 0))
+        output_name = args.output_name
+        downloads_dir = "downloads"
+        output_dir = "output"
+        auto_stitch = True
 
     if not NBA_API_AVAILABLE:
         print("Warning: nba_api is not installed. Install with: pip install nba_api")
@@ -687,19 +925,66 @@ def main() -> None:
     print(f"Creating highlight reel for {player_name}...")
     print("=" * 50)
 
-    finder = NBAHighlightsFinder(player_name=player_name, season=args.season)
-    games_limit: Optional[int] = None if args.all_games else max(1, args.max_games)
-    highlights = finder.get_highlights(
-        max_results=max_highlights,
-        max_games=games_limit,
-        event_type=args.event_type,
-    )
+    finder = NBAHighlightsFinder(player_name=player_name, season=season)
+    games_limit: Optional[int] = None if all_games else max(1, max_games)
+    candidate_games = finder.get_recent_games(max_games=games_limit if not target_date and recent_game_index is None else None)
+    if target_date or target_opponent:
+        filtered = []
+        for game in candidate_games:
+            date_ok = True
+            opp_ok = True
+            if target_date:
+                date_ok = _date_matches(target_date, str(game.get("date", "")))
+            if target_opponent:
+                opp_ok = str(target_opponent).upper() in str(game.get("matchup", "")).upper()
+            if date_ok and opp_ok:
+                filtered.append(game)
+        candidate_games = filtered
+
+    if recent_game_index is not None and candidate_games:
+        idx = max(0, int(recent_game_index))
+        candidate_games = candidate_games[idx : idx + 1]
+
+    if not candidate_games:
+        print("No matching games found for current filters.")
+        sys.exit(1)
+
+    # If blocks + selected specific game(s), use BLK context sequence directly.
+    highlights: List[Dict] = []
+    if event_type == "blocks":
+        for game in candidate_games:
+            highlights.extend(
+                finder._get_context_measure_video_candidates(
+                    game_id=game["game_id"],
+                    team_id=int(game.get("team_id", 0) or 0),
+                    context_measure="BLK",
+                )
+            )
+        # de-dup while preserving order
+        seen = set()
+        unique = []
+        for item in highlights:
+            url = item.get("url", "")
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            unique.append(item)
+            if len(unique) >= max_highlights:
+                break
+        highlights = unique
+    else:
+        # Fallback to existing generic flow
+        highlights = finder.get_highlights(
+            max_results=max_highlights,
+            max_games=games_limit,
+            event_type=event_type,
+        )
+
     if not highlights:
         print("No highlights found.")
         print("Try a different player, another season, or manual mode via stitch_videos.py")
         sys.exit(1)
 
-    downloader = VideoDownloader()
     downloaded: List[str] = []
     print(f"\nDownloading up to {len(highlights)} clips...")
     for index, highlight in enumerate(highlights, 1):
@@ -709,17 +994,11 @@ def main() -> None:
         if not source_url:
             continue
 
-        # If this is an NBA page, try extracting direct media URLs first.
-        candidate_urls = [source_url]
-        if "nba.com" in source_url:
-            extracted = finder.get_video_urls_from_page(source_url)
-            candidate_urls = extracted + candidate_urls
-
-        clip_path = None
-        for candidate in candidate_urls:
-            clip_path = downloader.download_video(candidate, f"highlight_{index:03d}.mp4")
-            if clip_path:
-                break
+        clip_path = download_video_from_source_url(
+            source_url=source_url,
+            output_filename=f"highlight_{index:03d}.mp4",
+            output_dir=downloads_dir,
+        )
         if clip_path:
             downloaded.append(clip_path)
 
@@ -731,9 +1010,20 @@ def main() -> None:
         print("Potential reasons: DRM, auth restrictions, or unsupported source URLs.")
         sys.exit(1)
 
-    stitcher = VideoStitcher()
+    # Optional trim step before stitching.
+    if trim_last_seconds > 0:
+        print(f"\nTrimming clips to last {trim_last_seconds} seconds...")
+        downloaded = trim_last_seconds_of_clips(downloaded, trim_last_seconds, downloads_dir)
+
+    if not auto_stitch:
+        print("\nAuto-stitch disabled by settings. Downloaded clips:")
+        for clip in downloaded:
+            print(clip)
+        return
+
+    stitcher = VideoStitcher(output_dir=output_dir)
     safe_name = re.sub(r"[^\w\s-]", "", player_name).strip().replace(" ", "_")
-    output_name = f"{safe_name}_highlight_reel.mp4"
+    output_name = output_name or f"{safe_name}_highlight_reel.mp4"
 
     print(f"\nStitching {len(downloaded)} clips...")
     final = stitcher.stitch_videos(downloaded, output_name)
